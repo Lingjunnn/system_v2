@@ -1,0 +1,38 @@
+# =========================
+# 模型及调试文件
+# =========================
+debug_frames/
+public/models/
+*.npy
+*.pt
+*.pth
+*.onnx
+
+# =========================
+# 前端 (Vue + Vite + Node)
+# =========================
+node_modules/
+dist/
+dist-ssr/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# 后端 (Python)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+
+# =========================
+# IDE & 操作系统
+# =========================
+.vscode/
+.idea/
+.DS_Store
