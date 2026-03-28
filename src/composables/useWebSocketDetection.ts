@@ -99,7 +99,7 @@ export function useWebSocketDetection(options: UseWebSocketDetectionOptions = {}
         isConnected.value = false
     }
 
-    const sendFrame = (videoElement: HTMLVideoElement): void => {
+    const sendFrame = (videoElement: HTMLVideoElement, videoName?: string): void => {
         console.log('[WS] sendFrame called, ws=', !!ws.value, 'connected=', isConnected.value)
         if (!ws.value || !isConnected.value) {
             console.log('[WS] Skipping frame: ws=', !!ws.value, 'connected=', isConnected.value)
@@ -155,7 +155,8 @@ export function useWebSocketDetection(options: UseWebSocketDetectionOptions = {}
                                 image: base64,
                                 width: videoWidth,
                                 height: videoHeight,
-                                timestamp: Date.now()
+                                timestamp: Date.now(),
+                                videoName: videoName || 'unknown.avi'
                             }
                         })
                     )
@@ -179,7 +180,8 @@ export function useWebSocketDetection(options: UseWebSocketDetectionOptions = {}
 
     const startContinuousDetection = (
         videoElement: HTMLVideoElement,
-        videoCallback?: () => HTMLVideoElement | null
+        videoName?: string,
+        videoCallback?: () => { video: HTMLVideoElement; videoName: string } | null
     ): void => {
         console.log('[WS] startContinuousDetection called')
         const frameInterval = 1000 / inferenceFps
@@ -187,11 +189,13 @@ export function useWebSocketDetection(options: UseWebSocketDetectionOptions = {}
 
         const detect = (timestamp: number): void => {
             let video = videoElement
+            let currentVideoName = videoName || 'unknown.avi'
 
             if (videoCallback) {
-                const cbVideo = videoCallback()
-                if (cbVideo) {
-                    video = cbVideo
+                const cbResult = videoCallback()
+                if (cbResult) {
+                    video = cbResult.video
+                    currentVideoName = cbResult.videoName
                 }
             }
 
@@ -202,8 +206,8 @@ export function useWebSocketDetection(options: UseWebSocketDetectionOptions = {}
                 video.readyState >= 2 &&
                 timestamp - lastFrameTime >= frameInterval
             ) {
-                console.log('[WS] Sending frame, paused=', video.paused, 'ended=', video.ended, 'readyState=', video.readyState)
-                sendFrame(video)
+                console.log('[WS] Sending frame, paused=', video.paused, 'ended=', video.ended, 'readyState=', video.readyState, 'videoName=', currentVideoName)
+                sendFrame(video, currentVideoName)
                 lastFrameTime = timestamp
             }
 

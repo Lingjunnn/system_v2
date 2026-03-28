@@ -473,7 +473,8 @@ const startVideoDetection = async () => {
 
   if (videoRef.value) {
     wsReset()
-    startWsDetection(videoRef.value)
+    const currentVideoName = currentVideoFiles.value[currentVideoIndex.value]?.name || 'unknown.avi'
+    startWsDetection(videoRef.value, currentVideoName)
     detectionTimer = 1
   }
 }

@@ -8,6 +8,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import cv2
@@ -17,9 +18,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics.utils.plotting import Annotator
 
+from database import save_fighting_result
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, "public", "models")
+SCREENSHOT_DIR = os.path.join(BASE_DIR, "data", "screenshots")
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
 @dataclass
@@ -346,6 +350,31 @@ async def root():
     return {"message": "Violence Detection WebSocket Server", "status": "running"}
 
 
+@app.get("/api/records")
+async def list_records(camera_id: Optional[str] = None):
+    """Get fighting detection records from database."""
+    from database import get_all_records, get_records_by_camera
+
+    if camera_id:
+        records = get_records_by_camera(camera_id)
+    else:
+        records = get_all_records()
+
+    return {
+        "total": len(records),
+        "records": [
+            {
+                "id": r.id,
+                "camera_id": r.camera_id,
+                "score": r.score,
+                "screenshot_path": r.screenshot_path,
+                "created_at": r.created_at.isoformat() if r.created_at else None
+            }
+            for r in records
+        ]
+    }
+
+
 @app.websocket("/ws/detect")
 async def websocket_detect(websocket: WebSocket):
     global websocket_connection, detector
@@ -353,6 +382,9 @@ async def websocket_detect(websocket: WebSocket):
     await websocket.accept()
     websocket_connection = websocket
     print(f"[WS] Client connected: {websocket.client}")
+
+    current_video_name: Optional[str] = None
+    last_frame: Optional[np.ndarray] = None
 
     try:
         while True:
@@ -363,23 +395,45 @@ async def websocket_detect(websocket: WebSocket):
 
                 if message.get("type") == "frame":
                     frame_base64 = message.get("data", {}).get("image")
+                    video_name = message.get("data", {}).get("videoName")
+
+                    if video_name:
+                        current_video_name = video_name
 
                     if frame_base64:
                         image_data = base64.b64decode(frame_base64)
                         nparr = np.frombuffer(image_data, np.uint8)
                         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        last_frame = frame.copy()
 
                         if frame is not None and detector is not None:
                             result = detector.process_frame(frame)
 
                             if result:
+                                screenshot_path = None
+                                if result.is_fight and last_frame is not None and current_video_name:
+                                    screenshot_path = save_screenshot(
+                                        last_frame,
+                                        current_video_name,
+                                        result.is_fight,
+                                        result.score
+                                    )
+
+                                    save_fighting_result(
+                                        video_name=current_video_name,
+                                        score=result.score,
+                                        screenshot_path=screenshot_path
+                                    )
+                                    print(f"[DB] Saved fighting result: {current_video_name} -> score={result.score:.4f}")
+
                                 response = {
                                     "type": "result",
                                     "data": {
                                         "score": float(result.score),
                                         "isFight": result.is_fight,
                                         "inferenceTimeMs": round(result.inference_time_ms, 2),
-                                        "timestamp": result.timestamp
+                                        "timestamp": result.timestamp,
+                                        "screenshotPath": screenshot_path
                                     }
                                 }
                                 await websocket.send_json(response)
@@ -387,6 +441,8 @@ async def websocket_detect(websocket: WebSocket):
                 elif message.get("type") == "reset":
                     if detector:
                         detector.reset()
+                        current_video_name = None
+                        last_frame = None
                         print("[WS] Buffer reset")
 
                 elif message.get("type") == "ping":
@@ -403,6 +459,33 @@ async def websocket_detect(websocket: WebSocket):
         print(f"[WS] WebSocket error: {e}")
     finally:
         websocket_connection = None
+
+
+def save_screenshot(
+    frame: np.ndarray,
+    video_name: str,
+    is_fight: bool,
+    score: float
+) -> str:
+    """
+    保存截图到本地
+
+    Args:
+        frame: 原始帧
+        video_name: 视频名称
+        is_fight: 是否为打斗
+        score: 置信度分数
+
+    Returns:
+        str: 截图保存路径
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    label = "fight" if is_fight else "normal"
+    filename = f"{video_name}_{label}_{score:.2f}_{timestamp}.jpg"
+    filepath = os.path.join(SCREENSHOT_DIR, filename)
+
+    cv2.imwrite(filepath, frame)
+    return filepath
 
 
 if __name__ == "__main__":
