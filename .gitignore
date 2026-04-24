@@ -7,7 +7,7 @@ public/models/
 *.pt
 *.pth
 *.onnx
-data/detection.zip
+data/
 
 # =========================
 # Ç°¶Ë (Vue + Vite + Node)
