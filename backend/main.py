@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import csv
 import json
 import os
 import queue
@@ -12,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 import cv2
+import httpx
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -23,7 +25,83 @@ from database import save_fighting_result
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, "public", "models")
 SCREENSHOT_DIR = os.path.join(BASE_DIR, "data", "screenshots")
+CALL_LOG_DIR = os.path.join(BASE_DIR, "data", "call_logs")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+os.makedirs(CALL_LOG_DIR, exist_ok=True)
+
+USE_MOCK = True
+MOCK_API_URL = "https://mock.apipost.net/mock/623e8f3eec52000/CallControl/UrgentCall?apipost_id=23e92badbee030"
+REAL_API_URL = "https://scc.yuqi.com:8001/CallControl/UrgentCall"
+COOLDOWN_SECONDS = 180
+CALL_LOG_FILE = os.path.join(CALL_LOG_DIR, "call_logs.csv")
+
+
+class CallLogManager:
+    _lock = threading.Lock()
+
+    @classmethod
+    def _ensure_header(cls):
+        if not os.path.exists(CALL_LOG_FILE):
+            with open(CALL_LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp",
+                    "trigger_status",
+                    "http_status_code",
+                    "response_body",
+                    "target_phone",
+                    "cooldown_status",
+                    "is_mock"
+                ])
+
+    @classmethod
+    def log(cls, trigger_status: str, http_status_code: int, response_body: str,
+            target_phone: str, cooldown_status: str, is_mock: bool):
+        with cls._lock:
+            cls._ensure_header()
+            with open(CALL_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    trigger_status,
+                    http_status_code,
+                    response_body,
+                    target_phone,
+                    cooldown_status,
+                    is_mock
+                ])
+
+
+class CooldownManager:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._last_call_time = 0
+                    cls._instance._call_lock = threading.Lock()
+        return cls._instance
+
+    def is_in_cooldown(self) -> bool:
+        with self._call_lock:
+            elapsed = time.time() - self._last_call_time
+            return elapsed < COOLDOWN_SECONDS
+
+    def get_remaining_seconds(self) -> int:
+        with self._call_lock:
+            elapsed = time.time() - self._last_call_time
+            remaining = COOLDOWN_SECONDS - elapsed
+            return max(0, int(remaining))
+
+    def record_call(self):
+        with self._call_lock:
+            self._last_call_time = time.time()
+
+
+cooldown_manager = CooldownManager()
 
 
 @dataclass
@@ -149,11 +227,11 @@ class ViolenceDetector:
             output = outputs[0]
             if isinstance(output, list):
                 output = np.array(output)
-            print(f"[DEBUG] YOLO output[0] shape: {output.shape}")
+            # print(f"[DEBUG] YOLO output[0] shape: {output.shape}")
 
             if len(output.shape) == 3 and output.shape[1] == 17:
                 num_people = output.shape[0]
-                print(f"[DEBUG] Detected {num_people} people")
+                #print(f"[DEBUG] Detected {num_people} people")
                 for person_idx in range(num_people):
                     kpts = np.zeros((17, 3), dtype=np.float32)
                     for i in range(17):
@@ -162,7 +240,7 @@ class ViolenceDetector:
                         kpts[i, 2] = output[person_idx, i, 2]
                     all_kpts.append(kpts)
             elif len(output.shape) == 3 and output.shape[2] == 57:
-                print(f"[DEBUG] Parsing YOLO pose output with shape {output.shape}")
+                #print(f"[DEBUG] Parsing YOLO pose output with shape {output.shape}")
                 output = output[0]
                 for det_idx in range(min(output.shape[0], 10)):
                     det = output[det_idx]
@@ -172,7 +250,7 @@ class ViolenceDetector:
                         kpts[i, 1] = det[i * 3 + 1] / 640.0 * h
                         kpts[i, 2] = det[i * 3 + 2]
                     all_kpts.append(kpts)
-                print(f"[DEBUG] Found {len(all_kpts)} detections")
+                #print(f"[DEBUG] Found {len(all_kpts)} detections")
 
         if not all_kpts:
             all_kpts.append(np.zeros((17, 3), dtype=np.float32))
@@ -217,37 +295,37 @@ class ViolenceDetector:
 
     def process_frame(self, frame_data: np.ndarray) -> Optional[DetectionResult]:
         with self.lock:
-            print(f"[DEBUG] Input frame: shape={frame_data.shape}, dtype={frame_data.dtype}, range=[{frame_data.min()}, {frame_data.max()}]")
+            #print(f"[DEBUG] Input frame: shape={frame_data.shape}, dtype={frame_data.dtype}, range=[{frame_data.min()}, {frame_data.max()}]")
 
             frame_gamma = cv2.LUT(frame_data, self.gamma_table)
-            print(f"[DEBUG] Gamma corrected: shape={frame_gamma.shape}, range=[{frame_gamma.min()}, {frame_gamma.max()}]")
+            #print(f"[DEBUG] Gamma corrected: shape={frame_gamma.shape}, range=[{frame_gamma.min()}, {frame_gamma.max()}]")
 
             pose_kpts = self.extract_pose(frame_gamma)
             pose_kpts_array = np.array(pose_kpts) if pose_kpts else np.zeros((1, 17, 3))
-            print(f"[DEBUG] Pose keypoints: num_people={len(pose_kpts)}, shape={pose_kpts_array.shape}, sum={pose_kpts_array[:, :, 2].sum():.2f}")
+            #print(f"[DEBUG] Pose keypoints: num_people={len(pose_kpts)}, shape={pose_kpts_array.shape}, sum={pose_kpts_array[:, :, 2].sum():.2f}")
 
             pose_frame = self.preprocess_pose_frame(frame_gamma, pose_kpts)
-            print(f"[DEBUG] Pose frame: shape={pose_frame.shape}, range=[{pose_frame.min():.4f}, {pose_frame.max():.4f}]")
+            #print(f"[DEBUG] Pose frame: shape={pose_frame.shape}, range=[{pose_frame.min():.4f}, {pose_frame.max():.4f}]")
 
             change_frame_raw = self.preprocess_change_frame(frame_gamma)
-            print(f"[DEBUG] Change frame raw: shape={change_frame_raw.shape}, range=[{change_frame_raw.min():.4f}, {change_frame_raw.max():.4f}]")
+            #print(f"[DEBUG] Change frame raw: shape={change_frame_raw.shape}, range=[{change_frame_raw.min():.4f}, {change_frame_raw.max():.4f}]")
 
             if self.prev_frame is not None:
                 prev_processed = self.preprocess_change_frame(self.prev_frame)
                 change_frame = self.compute_frame_diff(change_frame_raw, prev_processed)
-                print(f"[DEBUG] Change frame diff: range=[{change_frame.min():.4f}, {change_frame.max():.4f}]")
+                #print(f"[DEBUG] Change frame diff: range=[{change_frame.min():.4f}, {change_frame.max():.4f}]")
             else:
                 change_frame = np.zeros_like(change_frame_raw)
-                print(f"[DEBUG] First frame, change = zeros")
+                #print(f"[DEBUG] First frame, change = zeros")
 
             self.pose_buffer.append(pose_frame)
             self.change_buffer.append(change_frame)
             self.prev_frame = frame_gamma.copy()
 
-            print(f"[DEBUG] Buffers: pose={len(self.pose_buffer)}/{self.pose_buffer.buffer.maxlen}, change={len(self.change_buffer)}/{self.change_buffer.buffer.maxlen}")
+            #print(f"[DEBUG] Buffers: pose={len(self.pose_buffer)}/{self.pose_buffer.buffer.maxlen}, change={len(self.change_buffer)}/{self.change_buffer.buffer.maxlen}")
 
             if not self.pose_buffer.is_full() or not self.change_buffer.is_full():
-                print(f"[DEBUG] Buffer not full yet, returning None")
+                #print(f"[DEBUG] Buffer not full yet, returning None")
                 return None
 
             return self._run_inference()
@@ -256,14 +334,14 @@ class ViolenceDetector:
         pose_seq = np.array(self.pose_buffer.get_all(), dtype=np.float32)
         change_seq = np.array(self.change_buffer.get_all(), dtype=np.float32)
 
-        print(f"[DEBUG] pose_seq: shape={pose_seq.shape}, dtype={pose_seq.dtype}, range=[{pose_seq.min():.4f}, {pose_seq.max():.4f}]")
-        print(f"[DEBUG] change_seq: shape={change_seq.shape}, dtype={change_seq.dtype}, range=[{change_seq.min():.4f}, {change_seq.max():.4f}]")
+        #print(f"[DEBUG] pose_seq: shape={pose_seq.shape}, dtype={pose_seq.dtype}, range=[{pose_seq.min():.4f}, {pose_seq.max():.4f}]")
+        #print(f"[DEBUG] change_seq: shape={change_seq.shape}, dtype={change_seq.dtype}, range=[{change_seq.min():.4f}, {change_seq.max():.4f}]")
 
         pose_seq = np.expand_dims(pose_seq, axis=0)
         change_seq = np.expand_dims(change_seq, axis=0)
 
-        print(f"[DEBUG] Expanded pose_seq: shape={pose_seq.shape}")
-        print(f"[DEBUG] Expanded change_seq: shape={change_seq.shape}")
+        #print(f"[DEBUG] Expanded pose_seq: shape={pose_seq.shape}")
+        #print(f"[DEBUG] Expanded change_seq: shape={change_seq.shape}")
 
         start_time = time.perf_counter()
 
@@ -278,15 +356,15 @@ class ViolenceDetector:
 
             inference_time = (time.perf_counter() - start_time) * 1000
 
-            print(f"[DEBUG] Raw outputs: {outputs}")
+            #print(f"[DEBUG] Raw outputs: {outputs}")
             if outputs and len(outputs) > 0:
-                print(f"[DEBUG] Output[0] shape: {outputs[0].shape}, dtype: {outputs[0].dtype}")
-                print(f"[DEBUG] Output[0] content: {outputs[0]}")
+                #print(f"[DEBUG] Output[0] shape: {outputs[0].shape}, dtype: {outputs[0].dtype}")
+                #print(f"[DEBUG] Output[0] content: {outputs[0]}")
 
                 score = float(outputs[0][0])
 
                 provider = self.violence_session.get_providers()[0]
-                print(f"[INFERENCE] Score: {score:.4f}, Threshold: {self.threshold}, IsFight: {score > self.threshold}, Time: {inference_time:.1f}ms, Provider: {provider}")
+                #print(f"[INFERENCE] Score: {score:.4f}, Threshold: {self.threshold}, IsFight: {score > self.threshold}, Time: {inference_time:.1f}ms, Provider: {provider}")
 
                 return DetectionResult(
                     score=score,
@@ -323,6 +401,9 @@ detector: Optional[ViolenceDetector] = None
 websocket_connection: Optional[WebSocket] = None
 inference_thread: Optional[threading.Thread] = None
 should_run = threading.Event()
+consecutive_fight_frames: int = 0
+CONFIRMATION_FRAMES: int = 5
+fight_event_triggered: bool = False
 
 
 @app.on_event("startup")
@@ -377,10 +458,12 @@ async def list_records(camera_id: Optional[str] = None):
 
 @app.websocket("/ws/detect")
 async def websocket_detect(websocket: WebSocket):
-    global websocket_connection, detector
+    global websocket_connection, detector, consecutive_fight_frames, fight_event_triggered
 
     await websocket.accept()
     websocket_connection = websocket
+    consecutive_fight_frames = 0
+    fight_event_triggered = False
     print(f"[WS] Client connected: {websocket.client}")
 
     current_video_name: Optional[str] = None
@@ -410,21 +493,42 @@ async def websocket_detect(websocket: WebSocket):
                             result = detector.process_frame(frame)
 
                             if result:
-                                screenshot_path = None
-                                if result.is_fight and last_frame is not None and current_video_name:
-                                    screenshot_path = save_screenshot(
-                                        last_frame,
-                                        current_video_name,
-                                        result.is_fight,
-                                        result.score
-                                    )
+                                if result.is_fight:
+                                    consecutive_fight_frames += 1
+                                    print(f"[WS] 打斗帧检测: {consecutive_fight_frames}/{CONFIRMATION_FRAMES}")
 
-                                    save_fighting_result(
-                                        video_name=current_video_name,
-                                        score=result.score,
-                                        screenshot_path=screenshot_path
-                                    )
-                                    print(f"[DB] Saved fighting result: {current_video_name} -> score={result.score:.4f}")
+                                    if (consecutive_fight_frames >= CONFIRMATION_FRAMES
+                                            and not fight_event_triggered):
+                                        fight_event_triggered = True
+                                        screenshot_path = None
+                                        if last_frame is not None and current_video_name:
+                                            screenshot_path = save_screenshot(
+                                                last_frame,
+                                                current_video_name,
+                                                result.is_fight,
+                                                result.score
+                                            )
+
+                                            save_fighting_result(
+                                                video_name=current_video_name,
+                                                score=result.score,
+                                                screenshot_path=screenshot_path
+                                            )
+                                            print(f"[DB] Saved fighting result: {current_video_name} -> score={result.score:.4f}")
+                                            print(f"[WS] 连续 {consecutive_fight_frames} 帧打斗确认，触发紧急拨号")
+
+                                            asyncio.create_task(
+                                                trigger_emergency_call(
+                                                    video_name=current_video_name,
+                                                    score=result.score,
+                                                    screenshot_path=screenshot_path
+                                                )
+                                            )
+                                else:
+                                    if consecutive_fight_frames > 0:
+                                        print(f"[WS] 打斗结束，重置计数器 (was {consecutive_fight_frames})")
+                                    consecutive_fight_frames = 0
+                                    fight_event_triggered = False
 
                                 response = {
                                     "type": "result",
@@ -433,7 +537,7 @@ async def websocket_detect(websocket: WebSocket):
                                         "isFight": result.is_fight,
                                         "inferenceTimeMs": round(result.inference_time_ms, 2),
                                         "timestamp": result.timestamp,
-                                        "screenshotPath": screenshot_path
+                                        "screenshotPath": None
                                     }
                                 }
                                 await websocket.send_json(response)
@@ -441,6 +545,8 @@ async def websocket_detect(websocket: WebSocket):
                 elif message.get("type") == "reset":
                     if detector:
                         detector.reset()
+                        consecutive_fight_frames = 0
+                        fight_event_triggered = False
                         current_video_name = None
                         last_frame = None
                         print("[WS] Buffer reset")
@@ -486,6 +592,96 @@ def save_screenshot(
 
     cv2.imwrite(filepath, frame)
     return filepath
+
+
+async def trigger_emergency_call(video_name: str, score: float, screenshot_path: str):
+    if cooldown_manager.is_in_cooldown():
+        remaining = cooldown_manager.get_remaining_seconds()
+        print(f"[EMERGENCY] 处于冷却期，跳过拨号。剩余冷却时间: {remaining}秒")
+        CallLogManager.log(
+            trigger_status="跳过-冷却中",
+            http_status_code=0,
+            response_body=f"冷却中，剩余{remaining}秒",
+            target_phone="N/A",
+            cooldown_status=f"冷却中({remaining}秒)",
+            is_mock=USE_MOCK
+        )
+        return
+
+    target_url = MOCK_API_URL if USE_MOCK else REAL_API_URL
+    payload = {
+        "camera_id": video_name,
+        "event_type": "fight_detected",
+        "score": float(score),
+        "screenshot_path": screenshot_path,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    print(f"[EMERGENCY] 触发紧急拨号: {target_url}")
+    print(f"[EMERGENCY] Payload: {json.dumps(payload, ensure_ascii=False)}")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(target_url, json=payload)
+            response_body = response.text
+
+            print(f"[EMERGENCY] 响应状态码: {response.status_code}")
+            print(f"[EMERGENCY] 响应内容: {response_body}")
+
+            if response.status_code == 200:
+                cooldown_manager.record_call()
+                print(f"[EMERGENCY] 拨号成功，已启动3分钟冷却")
+                CallLogManager.log(
+                    trigger_status="成功",
+                    http_status_code=response.status_code,
+                    response_body=response_body,
+                    target_phone=target_url,
+                    cooldown_status="已冷却(180秒)",
+                    is_mock=USE_MOCK
+                )
+            else:
+                print(f"[EMERGENCY] 拨号失败，HTTP {response.status_code}")
+                CallLogManager.log(
+                    trigger_status="失败",
+                    http_status_code=response.status_code,
+                    response_body=response_body,
+                    target_phone=target_url,
+                    cooldown_status="未冷却",
+                    is_mock=USE_MOCK
+                )
+
+    except httpx.TimeoutException:
+        print(f"[EMERGENCY] 请求超时")
+        CallLogManager.log(
+            trigger_status="失败-超时",
+            http_status_code=0,
+            response_body="请求超时(30秒)",
+            target_phone=target_url,
+            cooldown_status="未冷却",
+            is_mock=USE_MOCK
+        )
+    except httpx.ConnectError as e:
+        print(f"[EMERGENCY] 连接错误: {e}")
+        CallLogManager.log(
+            trigger_status="失败-连接错误",
+            http_status_code=0,
+            response_body=f"连接错误: {str(e)}",
+            target_phone=target_url,
+            cooldown_status="未冷却",
+            is_mock=USE_MOCK
+        )
+    except Exception as e:
+        print(f"[EMERGENCY] 未知错误: {e}")
+        import traceback
+        traceback.print_exc()
+        CallLogManager.log(
+            trigger_status="失败-异常",
+            http_status_code=0,
+            response_body=f"异常: {str(e)}",
+            target_phone=target_url,
+            cooldown_status="未冷却",
+            is_mock=USE_MOCK
+        )
 
 
 if __name__ == "__main__":
